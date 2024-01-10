@@ -24,12 +24,17 @@ import google.auth
 from google.auth.transport.requests import Request
 from google.auth.compute_engine import _metadata
 
+# Checks for service account
 if hasattr(credentials, "service_account_email"):
-    if credentials.service_account_email == "default":
-        info = _metadata.get_service_account_info(Request(),service_account=credentials.service_account_email)
-        return info['email']
+    return credentials.service_account_email[:-20]
+else:
+    # Defaults to getting the user account
+    command = ["gcloud", "auth", "list", "--filter=status:ACTIVE", "--format=value(account)"]
+    result = subprocess.run(command, stdout=subprocess.PIPE, text=True)
+    if result.returncode == 0:
+        return result.stdout.strip()
     else:
-        return credentials.service_account_email[:-20]
+        return f"Error: {result.stderr}"
         
 class CloudSQLEngine:
     """Creating a connection to the CloudSQL instance
@@ -165,19 +170,19 @@ class CloudSQLVectorStore(VectorStore):
         self.create_default_table(metadata)
 
     def create_vector_extension(self):
-        """"""
+        """Creates the vector extsion to the specified database."""
         query = sqlalchemy.text("CREATE EXTENSION IF NOT EXISTS vector")
         with self.engine.connect() as connection:
             connection.execute(query)
 
     def create_default_table(self, metadata):
-        """Creates the default table"""
+        """Creates the default table."""
         table = Table(
             self.table_name, metadata,
             Column('uuid', UUID(as_uuid=True), primary_key=True, default=uuid.uuid4),
-            Column(self.content_column, String, nullable=False),
-            Column(self.embedding_column, Vector(self.vector_size), nullable=True),
-            Column(self.metadata_columns, JSON, nullable=True)
+            Column('content', String, nullable=False),
+            Column('embedding', Vector(), nullable=True),
+            Column('metadata', JSON, nullable=True)
             )
 
         metadata.create_all(self.engine)
