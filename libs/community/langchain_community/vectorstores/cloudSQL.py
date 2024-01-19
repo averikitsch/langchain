@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import uuid
 
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type
@@ -10,31 +8,28 @@ from langchain_core.embeddings import Embeddings
 
 from google.cloud.sql.connector import Connector
 import google.auth
+from google.auth.transport.requests import Request
+from google.auth.compute_engine import _metadata
 
-import sqlalchemy
 from sqlalchemy import inspect
-from sqlalchemy import Table, Column, Integer, String
 from sqlalchemy.dialects.postgresql import JSON, UUID
 
 from pgvector.sqlalchemy import Vector
 
 def _get_IAM_user(credentials):
-"""Get user/service account name"""
-import google.auth
-from google.auth.transport.requests import Request
-from google.auth.compute_engine import _metadata
+    """Get user/service account name"""
 
-# Checks for service account
-if hasattr(credentials, "service_account_email"):
-    return credentials.service_account_email[:-20]
-else:
-    # Defaults to getting the user account
-    command = ["gcloud", "auth", "list", "--filter=status:ACTIVE", "--format=value(account)"]
-    result = subprocess.run(command, stdout=subprocess.PIPE, text=True)
-    if result.returncode == 0:
-        return result.stdout.strip()
+    # Checks for service account
+    if hasattr(credentials, "service_account_email"):
+        return credentials.service_account_email[:-20]
     else:
-        return f"Error: {result.stderr}"
+        # Defaults to getting the user account
+        command = ["gcloud", "auth", "list", "--filter=status:ACTIVE", "--format=value(account)"]
+        result = subprocess.run(command, stdout=subprocess.PIPE, text=True)
+        if result.returncode == 0:
+            return result.stdout.strip()
+        else:
+            return f"Error: {result.stderr}"
         
 class CloudSQLEngine:
     """Creating a connection to the CloudSQL instance
@@ -60,9 +55,9 @@ class CloudSQLEngine:
             project_id (str): GCP project ID. Defaults to None
 
         Returns:
-            Sqlalchemy engine containg the connection pool.
+            Sqlalchemy engine containing the connection pool.
         """
-        
+
         if project_id is None:
             credentials, project_id = google.auth.default()
 
@@ -81,16 +76,17 @@ class CloudSQLEngine:
         return pool
         
 class CloudSQLVectorStore(VectorStore):
-    """GCP CloudSQL vector store.
+    """Google Cloud SQL vector store.
 
     To use, you need the following packages installed:
         pgvector-python
         sqlalchemy
+        cloud-sql-python-connector[asyncpg]
     """
     
     def __init__(
         self, 
-        engine: sqlalchemy.engine.Engine, 
+        engine: CloudSQLEngine, 
         embedding_service: Embeddings, 
         table_name: str, 
         content_column: str='content', 
@@ -110,7 +106,7 @@ class CloudSQLVectorStore(VectorStore):
             content_column (str): Column that represent a Document’s page_content. Defaults to content
             embedding_column (str): Column for embedding vectors. 
                               The embedding is generated from the document value. Defaults to embedding
-            metadata_columns (List[str]): Column(s) that represent a document's metdata. Defaults to metdata
+            metadata_columns (List[str]): Column(s) that represent a document's metadata. Defaults to metadata
             ignore_metadata_columns (List[str]): Column(s) to ignore in pre-existing tables for a document’s metadata. 
                                      Can not be used with metadata_columns. Defaults to None
             overwrite_existing (bool): Boolean for truncating table before inserting data. Defaults to False
@@ -144,12 +140,12 @@ class CloudSQLVectorStore(VectorStore):
         """Initialize table and validate existing tables"""
         self.create_vector_extension()
 
-        metadata = sqlalchemy.MetaData()
-
         if self.overwrite_existing:
-            table_to_drop = Table(self.table_name, metadata, autoload_with=self.engine)
-            table_to_drop.drop(self.engine)
-            self.create_table(metadata)
+            drop_stmt = sqlalchemy.text(f"DROP TABLE IF EXISTS {self.table_name}")
+            with self.engine.connect() as connection:
+                connection.execute(drop_stmt)
+                connection.commit()
+            self.create_table()
 
         # If both metadata and ignore_metadata are given, throw an error
         if self.metadata_columns is not None and self.ignore_metadata_columns is not None:
@@ -169,52 +165,64 @@ class CloudSQLVectorStore(VectorStore):
 
         self.create_default_table(metadata)
 
-    def create_vector_extension(self):
+    def embeddings(
+        self
+    ) -> Embeddings:
+        return self.embedding_service
+
+    def create_vector_extension(
+        self
+    ) -> None:
         """Creates the vector extsion to the specified database."""
         query = sqlalchemy.text("CREATE EXTENSION IF NOT EXISTS vector")
         with self.engine.connect() as connection:
             connection.execute(query)
+            connection.commit()
 
-    def create_default_table(self, metadata):
+    def create_default_table(
+        self
+    ) -> None:
         """Creates the default table."""
-        table = Table(
-            self.table_name, metadata,
-            Column('uuid', UUID(as_uuid=True), primary_key=True, default=uuid.uuid4),
-            Column('content', String, nullable=False),
-            Column('embedding', Vector(), nullable=True),
-            Column('metadata', JSON, nullable=True)
-            )
-
-        metadata.create_all(self.engine)
+        if self.engine.dialect.has_table(self.engine.connect(), self.table_name) and self.overwrite_existing == False:
+            raise ValueError("Table already exists.")
+        else:
+            query = f'''
+               CREATE TABLE IF NOT EXISTS {self.table_name} (
+                   uuid UUID PRIMARY KEY,
+                   content VARCHAR(255) NOT NULL,
+                   embedding vector NOT NULL,
+                   metadata JSON NOT NULL
+               );
+               '''
+            with self.engine.connect() as connection:
+                result = connection.execute(sqlalchemy.text(query))
+                connection.commit()
 
     
-    @classmethod
     def init_vector_store(
-        cls, 
-        engine: sqlalchemy.engine.Engine, 
+        self,  
         table_name: str, 
         vector_size: int, 
         content_column: str='content', 
         embedding_column: str='embedding', 
         metadata_columns: Optional[str, List[str]]='metadata',
+        index: HNSWIndex,
         overwrite_existing: bool=False, 
-        store_metadata: bool=False
+        store_metadata: bool=True
     ) -> None:
 
         """Creating a non-default vectorstore table"""
-
-        metadata = sqlalchemy.MetaData()
-
-        table = Table(
-            table_name, metadata,
-            Column('uuid', UUID(as_uuid=True), primary_key=True, default=uuid.uuid4),
-            Column(content_column, String, nullable=True),
-            Column(embedding_column, Vector(vector_size), nullable=True),
-            Column(metadata_columns, JSON, nullable=True),
-
-        )
-
-        metadata.create_all(engine)
+        query = f'''
+        CREATE TABLE IF NOT EXISTS {table_name} (
+            uuid UUID PRIMARY KEY,
+            {content_column} VARCHAR(255) NOT NULL,
+            {embedding_column} vector({vector_size}) NOT NULL,
+            {metadata_columns} JSON NOT NULL
+        );
+        '''
+        with self.engine.connect() as connection:
+            result = connection.execute(text(query))
+            connection.commit()
     
     @classmethod
     def from_documents(
@@ -222,19 +230,24 @@ class CloudSQLVectorStore(VectorStore):
         docs: List[Document], 
         engine: sqlalchemy.engine.Engine, 
         table_name: str,
-        embedding_service: Embeddings
-    ):
+        embedding_service: Embeddings,
+        ids: Optional[List[str]] = None
+    ) -> CloudSQLVectorStore:
          """Return VectorStore initialized from documents and embeddings."""
-            
-        texts = [d.page_content for d in docs]
-        metadatas = [d.metadata for d in docs]
-        
-        return cls.from_texts(
-            texts=texts, 
-            metadatas=metadatas,
+        texts = [d.page_content for d in documents]
+        metadatas = [d.metadata for d in documents]
+        embeddings = embedding_service.embed_documents(list(texts))
+
+        table = cls(
+            engine=engine,
             embedding_service=embedding_service,
-            engine=engine, 
-            table_name=table_name)
+            table_name=table_name,
+        )
+
+        table.add_embeddings(
+            texts=texts, engine=engine, embeddings=embeddings, metadatas=metadatas, ids=ids, table_name=table_name)
+        
+        return table
     
     @classmethod
     def from_texts(
@@ -243,40 +256,52 @@ class CloudSQLVectorStore(VectorStore):
         metadatas: List[Dict]=None,
         embedding_service: Embeddings,
         engine: sqlalchemy.engine.Engine, 
-        table_name: str
-    ):
+        table_name: str,
+        ids: Optional[List[str]]=None
+    ) -> CloudSQLVectorStore:
         """ Return VectorStore initialized from texts and embeddings."""
-        
-        ids = [str(uuid.uuid1()) for _ in texts]
-        embeddings = embedding_service.embed_documents(list(texts))
-        
         if not metadatas:
             metadatas = [{} for _ in texts]
 
-        metadata = sqlalchemy.MetaData()
+        documents = []
+        for text, meta in zip(texts, metadatas):
+            docs = Document(page_content = text, metadata=meta)
+            documents.append(docs)
 
-        table = Table(
-            table_name, metadata,
-            Column('uuid', UUID(as_uuid=True), primary_key=True, default=uuid.uuid4),
-            Column(content_column, String, nullable=True),
-            Column(embedding_column, Vector(vector_size), nullable=True),
-            Column(metadata_columns, JSON, nullable=True),
+        return cls.from_documents(
+            engine=engine,
+            documents=documents,
+            embedding_service=embedding_service,
+            table_name=table_name,
+            ids=ids)
 
-        )
+    def add_embeddings(
+        self,
+        engine: CloudSQLEngine,
+        texts: List[str],
+        embeddings: Embeddings,
+        metadatas: List[float]=None,
+        ids: Optional[List[str]]=None,
+        table_name: str
+    ) -> List[str]:
+
+        if ids is None:
+            ids = [str(uuid.uuid1()) for _ in texts]
 
         with engine.connect() as connection:
-            for id, content, embedding, meta in zip(ids, text, embeddings, metadatas):
-                connection.execute(table.insert().values(
-                    uuid=id, 
-                    content=content, 
-                    embedding=embedding,
-                    metadata=meta))
+            for id, content, embedding, meta in zip(ids, texts, embeddings, metadatas):
+                data_to_add = {"ids":id, 'content':content, 'embedding':embedding, 'metadata':meta}
+                stmt = f"INSERT INTO {table_name}(ids, content, embedding, metadata) VALUES (:ids, :content, :embedding, :metadata)"
+                connection.execute(sqlalchemy.text(stmt), data_to_add)
+                connection.commit()
+
+        return ids
 
     def add_documents(
         self, 
         documents: List[Document], 
         ids: Optional[List[str]]=None
-        ):
+        ) -> List[str]:
          """Run more documents through the embeddings and add to the vectorstore.
 
         Args:
@@ -286,18 +311,25 @@ class CloudSQLVectorStore(VectorStore):
         Returns:
             List of ids from adding the texts into the vectorstore.
         """
-
         texts = [d.page_content for d in documents]
         metadatas = [d.metadata for d in documents]
+        embeddings = self.embedding_service.embed_documents(list(texts))
 
-        return self.add_texts(texts=texts, metadatas=metadatas, ids=None)
+        return self.add_embeddings(
+            texts=texts, 
+            embeddings=embeddings, 
+            metadatas=metadatas, 
+            ids=ids, 
+            engine=self.Engine, 
+            table_name=self.table_name)
+
 
     def add_texts(
         self, 
         texts: Iterable[str], 
         metadatas: Optional[List[dict]]=None, 
         ids: Optional[List[str]]=None
-        ):
+        ) -> List[str]:
          """Run more texts through the embeddings and add to the vectorstore.
 
         Args:
@@ -308,23 +340,14 @@ class CloudSQLVectorStore(VectorStore):
         Returns:
             List of ids from adding the texts into the vectorstore.
         """
+        if not metadata:
+            metadata = [{} for _ in texts]
 
-        embeddings = self.embedding_service.embed_documents(list(texts))
+        documents = []
+        for text, meta in zip(texts, metadata):
+            docs = Document(page_content = text, metadata=meta)
+            documents.append(docs)
 
-        if ids is None:
-            ids = [str(uuid.uuid1()) for _ in texts]
-
-        if not metadatas:
-            metadatas = [{} for _ in texts]
-
-        data = dict(zip())
-
-        with self.engine.connect() as connection:
-                for id, content, embedding, meta in zip(ids, text, embeddings, metadatas):
-                    connection.execute(self.table.insert().values(
-                        uuid=id, 
-                        content=content, 
-                        embedding=embedding,
-                        metadata=meta))
-
-        return ids
+        return add_documents(
+            documents=documents,
+            ids=ids)
