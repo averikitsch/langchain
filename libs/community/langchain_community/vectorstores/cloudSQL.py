@@ -5,6 +5,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Type
 from langchain_core.documents import Document
 from langchain_core.vectorstores import VectorStore
 from langchain_core.embeddings import Embeddings
+from langchain_community.vectorstores.utils import maximal_marginal_relevance
 
 from google.cloud.sql.connector import Connector
 import google.auth
@@ -351,3 +352,124 @@ class CloudSQLVectorStore(VectorStore):
         return add_documents(
             documents=documents,
             ids=ids)
+
+    def __query_collection(
+        self,
+        embedding: List[float],
+        k: int=4,
+        filter: str=""
+    ) -> List[Any]:
+
+        if filter is not None:
+            condition = f"WHERE {filter}"
+
+        query = f"""
+            SELECT uuid, {self.content_column}, {self.embedding_column}, metadata, 
+            l2_distance({self.embedding_column}, '{embedding}') as distance 
+            FROM {self.table_name} {condition} ORDER BY {self.embedding_column} <-> '{embedding}' LIMIT {k}
+        """
+        with self.engine.connect() as connection:
+            results = connection.execute(sqlalchemy.text(query)).fetchall()
+            connection.commit()
+
+        return results
+
+    def similarity_search(
+        self, 
+        query: str, 
+        k: int=4, 
+        filter: str=""
+    ) -> List[Document]:
+
+        embedding = self.embedding_service.embed_query(text=query)
+        
+        return self.similarity_search_by_vector(
+            embedding=embedding, 
+            k=k, 
+            filter=filter
+        )
+
+    def similarity_search_by_vector(
+        self,
+        embedding: List[float],
+        k: int=4,
+        filter: str=""
+    ) -> List[Document]:
+
+        docs_and_scores = self.similarity_search_with_score_by_vector(
+            embedding=embedding, k=k, filter=filter
+        )
+
+        return [doc for doc, _ in docs_and_scores]
+
+    def similarity_search_with_score_by_vector(
+        self,
+        embedding: List[float],
+        k: int=4,
+        filter: str=""
+    ) -> List[Tuple[Document, float]]:
+
+        results = self.__query_collection(embedding=embedding, k=k, filter=filter)
+        
+        documents_with_scores = [(Document(page_content=i[1],metadata=i[3],),i[4],)for i in results]
+        return documents_with_scores
+
+    def max_marginal_relevance_search(
+        self,
+        query: str,
+        k: int=4,
+        fetch_k: int=20,
+        lambda_mult: float=0.5,
+        filter: str=""
+    ) -> List[Document]:
+
+        embedding = self.embedding_service.embed_query(text=query)
+        
+        return self.max_marginal_relevance_search_by_vector(
+            embedding=embedding, 
+            k=k,
+            fetch_k=fetch_k,
+            lambda_mult=lambda_mult,
+            filter=filter
+        )
+
+    def max_marginal_relevance_search_by_vector(
+        self,
+        embedding: List[float],
+        k: int=4,
+        fetch_k: int=20,
+        lambda_mult: float=0.5,
+        filter: str=""
+    ) -> List[Document]:
+
+        docs_and_scores = self.max_marginal_relevance_search_with_score_by_vector(
+            embedding,
+            k=fetch_k,
+            lambda_mult=lambda_mult,
+            filter=filter
+        )
+
+        return return [doc for doc, _ in docs_and_scores]
+
+    def max_marginal_relevance_search_with_score_by_vector(
+        self,
+        embedding: List[float],
+        k: int=4,
+        fetch_k: int=20,
+        lambda_mult: float=0.5,
+        filter: str=""
+    ) -> > List[Tuple[Document, float]]:
+
+        results = self.__query_collection(embedding=embedding, k=fetch_k, filter=filter)
+        embedding_list = [i[2] for i in results]
+
+        mmr_selected = maximal_marginal_relevance(
+            np.array(embedding, dtype=np.float32),
+            embedding_list,
+            k=k,
+            lambda_mult=lambda_mult,
+        )
+
+        candidates = [(Document(page_content=i[1],metadata=i[3],),i[4],)for i in results]
+
+        return [r for i, r in enumerate(candidates) if i in mmr_selected]
