@@ -1,53 +1,69 @@
+"""Vector Store for Google Cloud SQL"""
+import json
 import uuid
-
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type
-
-from langchain_core.documents import Document
-from langchain_core.vectorstores import VectorStore
-from langchain_core.embeddings import Embeddings
-from langchain_community.vectorstores.utils import maximal_marginal_relevance
-
+import asyncio
+from typing import Any, Dict, List, Optional, Tuple, Type
+import aiohttp
+import nest_asyncio
 from google.cloud.sql.connector import Connector
 import google.auth
-from google.auth.transport.requests import Request
-from google.auth.compute_engine import _metadata
+from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
+from langchain_core.vectorstores import VectorStore
+from langchain_community.vectorstores.utils import maximal_marginal_relevance
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+import numpy as np
+from pgvector.asyncpg import register_vector
 
-from sqlalchemy import inspect
-from sqlalchemy.dialects.postgresql import JSON, UUID
+nest_asyncio.apply()
 
-from pgvector.sqlalchemy import Vector
-
-def _get_IAM_user(credentials):
+async def _get_IAM_user(credentials):
     """Get user/service account name"""
+    request = google.auth.transport.requests.Request()
+    credentials.refresh(request)
 
-    # Checks for service account
-    if hasattr(credentials, "service_account_email"):
-        return credentials.service_account_email[:-20]
-    else:
-        # Defaults to getting the user account
-        command = ["gcloud", "auth", "list", "--filter=status:ACTIVE", "--format=value(account)"]
-        result = subprocess.run(command, stdout=subprocess.PIPE, text=True)
-        if result.returncode == 0:
-            return result.stdout.strip()
-        else:
-            return f"Error: {result.stderr}"
-        
-class CloudSQLEngine:
+    url = f"https://oauth2.googleapis.com/tokeninfo?access_token={credentials.token}"
+    async with aiohttp.ClientSession() as client:
+        response = await client.get(url)
+        response = await response.text()
+        response = json.loads(response)
+        email =  response['email']
+        if ".gserviceaccount.com" in email:
+            email = email.replace(".gserviceaccount.com","")
+
+        return email
+
+class cloudSQLEngine:
     """Creating a connection to the CloudSQL instance
-    To use, you need the following packages installed:
-        cloud-sql-python-connector[asyncpg]
+        To use, you need the following packages installed:
+            cloud-sql-python-connector[asyncpg]
     """
-    
-    connector = Connector()
-    
-    @staticmethod
+    def __init__(
+        self,
+        project_id=None,
+        region=None,
+        instance=None,
+        database=None,
+        engine=None
+    ):
+        self.project_id = project_id
+        self.region = region
+        self.instance = instance
+        self.database = database
+        self.engine = engine
+        self._pool = asyncio.get_event_loop().run_until_complete(self._engine())
+
+    @classmethod
     def from_instance(
-        region: str, 
-        instance: str, 
-        database: str, 
-        project_id: str=None
-    ) -> sqlalchemy.engine.Engine:
-     """Create sqlalchemy connection to the postgres database in the CloudSQL instance.
+        cls: Type[cloudSQLEngine],
+        region: str,
+        instance: str,
+        database: str,
+        project_id: str=None,
+    ) -> cloudSQLEngine:
+
+        """Create cloudSQLEngine connection to the postgres database in the CloudSQL instance.
 
         Args:
             region (str): CloudSQL instance region.
@@ -56,48 +72,91 @@ class CloudSQLEngine:
             project_id (str): GCP project ID. Defaults to None
 
         Returns:
-            Sqlalchemy engine containing the connection pool.
+            cloudSQLEngine containing the asyncpg connection pool.
         """
+        return cls(project_id=project_id, region=region, instance=instance, database=database)
 
-        if project_id is None:
-            credentials, project_id = google.auth.default()
+    @classmethod
+    def from_engine(
+        cls: Type[cloudSQLEngine],
+        engine: AsyncEngine
+    ) -> cloudSQLEngine:
 
-        IAM_USER = _get_IAM_user(credentials)
-        
-        conn = connector.connect(
-            INSTANCE_URI = f"{project_id}:{region}:{instance}",
-            'asyncpg',
-            user = IAM_USER,
-            db = database,
-            enable_iam_auth = True
+        return cls(engine=engine)
+
+    async def _engine(
+        self
+    ) -> AsyncEngine:
+
+        if self.engine is not None:
+            return self.engine
+
+        credentials, _ = google.auth.default(scopes=['email', 'https://www.googleapis.com/auth/cloud-platform'])
+
+        if self.project_id is None:
+            self.project_id = _
+
+        async def get_conn():
+            async with Connector(loop=asyncio.get_running_loop()) as connector:
+                conn = await connector.connect_async(
+                        f"{self.project_id}:{self.region}:{self.instance}",
+                        "asyncpg",
+                        user=await _get_IAM_user(credentials),
+                        enable_iam_auth=True,
+                        db=self.database,
+                    )
+
+            await register_vector(conn)
+            return conn
+
+        pool = create_async_engine(
+                "postgresql+asyncpg://",
+                async_creator=get_conn,
         )
-        
-        pool = sqlalchemy.create_engine("postgresql+asyncpg://",creator=conn)
-        
+
         return pool
+    
+    async def _aexecute_fetch(
+        self, 
+        query: str
+    ) -> Any:
+
+        async with self._pool.connect() as conn:
+            result = (await conn.execute(text(query)))
+            result_map = result.mappings()
+            result_fetch = result_map.fetchall()
+
+        return result_fetch
+
+    async def _aexecute_update(
+        self, 
+        query: str, 
+        additional: Dict=None
+    ) -> None:
+
+        async with self._pool.connect() as conn:
+            result = (await conn.execute(text(query),additional))
+            result = result.mappings()
+            await conn.commit()
         
-class CloudSQLVectorStore(VectorStore):
+class cloudSQLVectorStore(VectorStore):
     """Google Cloud SQL vector store.
 
     To use, you need the following packages installed:
         pgvector-python
         sqlalchemy
-        cloud-sql-python-connector[asyncpg]
     """
-    
-    def __init__(
-        self, 
-        engine: CloudSQLEngine, 
-        embedding_service: Embeddings, 
-        table_name: str, 
-        content_column: str='content', 
-        embedding_column: str='embedding', 
-        metadata_columns: Optional[str, List[str]]='metadata', 
-        ignore_metadata_columns: Optional[str, List[str]]=None, 
-        overwrite_existing: bool=False, 
-        index_query_options=None, 
-        distance_strategy: str="L2"
-    ) -> None:
+
+    def __init__(self,
+            engine: Type[cloudSQLEngine],
+            table_name: str,
+            embedding_service: Embeddings,
+            content_column: str='content',
+            embedding_column: str='embedding',
+            metadata_columns: Optional[str, List[str]]='metadata',
+            ignore_metadata_columns: bool=False,
+            overwrite_existing: bool=False,
+    ):
         """Constructor for CloudSQLVectorStore.
 
         Args:
@@ -123,120 +182,158 @@ class CloudSQLVectorStore(VectorStore):
                     two vectors. This metric considers the geometric distance in
                     the vector space, and might be more suitable for embeddings
                     that rely on spatial relationships. This is the default behavior.
-            """
+        """
 
         self.engine = engine
-        self.embedding_service = embedding_service
         self.table_name = table_name
-        self.content_column = content_column
+        self.embedding_service = embedding_service
         self.embedding_column = embedding_column
+        self.content_column = content_column
         self.metadata_columns = metadata_columns
         self.ignore_metadata_columns = ignore_metadata_columns
         self.overwrite_existing = overwrite_existing
-        self.index_query_options = index_query_options
-        self.distance_strategy = distance_strategy
-        self.__post_init__()
-        
-    def __post_init__(self) -> None:
+        asyncio.get_running_loop().run_until_complete(self.__post_init__())
+
+    async def __post_init__(self) -> None:
         """Initialize table and validate existing tables"""
-        self.create_vector_extension()
+        await self.create_vector_extension()
+        
+        # Check if table exists
+        query = f"SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = '{self.table_name}');"
+        result = await self.engine._aexecute_fetch(query)
+        # If table exists
+        if result[0]['exists']:
+            # If overwrite_existing is True Truncate the Table
+            if self.overwrite_existing:
+                query = f"TRUNCATE TABLE {self.table_name} RESET IDENTITY"
+                await self.engine._aexecute_update(query)
 
-        if self.overwrite_existing:
-            drop_stmt = sqlalchemy.text(f"DROP TABLE IF EXISTS {self.table_name}")
-            with self.engine.connect() as connection:
-                connection.execute(drop_stmt)
-                connection.commit()
-            self.create_table()
-
-        # If both metadata and ignore_metadata are given, throw an error
-        if self.metadata_columns is not None and self.ignore_metadata_columns is not None:
-            raise ValueError("Both metadata_columns and ignore_metadata_columns have been provided.")
-
-        if self.engine.dialect.has_table(self.engine.connect(), self.table_name):
-            inspector = inspect(self.engine)
-            column_names = [column['name'] for column in inspector.get_columns(self.table_name)]
-            if self.embedding_column not in column_names:
-                raise ValueError(f"Column {self.embedding_column} does not exist")
-            if self.content_column not in column_names:
+            # Checking if metadata and ignore_metadata are given together
+            if self.metadata_columns is not None and self.ignore_metadata_columns is not None:
+                raise ValueError("Both metadata_columns and ignore_metadata_columns have been provided.")
+            
+            get_name = f"SELECT column_name, data_type FROM information_schema.columns WHERE table_name = '{self.table_name}'"
+            result = await self.engine._aexecute_fetch(get_name)
+            column_name = [col['column_name'] for col in result]
+            dtypes = [dtype['data_type'] for dtype in result]
+            
+            # Check column names and datatype for embedding column
+            if 'uuid' not in column_name:
+                raise ValueError(f"Column uuid does not exist")
+            if self.content_column not in column_name:
                 raise ValueError(f"Column {self.content_column} does not exist")
-            if 'metadata' not in column_names:
-                raise ValueError(f"Column 'metadata' does not exist")
-            if 'uuid' not in column_names:
-                raise ValueError(f"Column 'uuid' does not exist")
+            if self.embedding_column in column_name:
+                if "USER-DEFINED" not in dtypes:
+                    raise ValueError(f"Column {self.embedding_column} is not of type vector")
+            else:
+                raise ValueError(f"Column {self.embedding_column} does not exist")
 
-        self.create_default_table(metadata)
+            if 'metadata' not in column_name:
+                raise ValueError(f"Column metadata does not exist")
+            
+            # Check if there are non-nullable columns
+            query = f"SELECT column_name FROM information_schema.columns WHERE table_name = '{self.table_name}' AND is_nullable = 'NO';"
+            result = await self.engine._aexecute_fetch(query)
+            non_nullable_list = [n['column_name'] for n in result]
+            exceptions = set(["uuid", f"{self.content_column}"])
+            other_values = [value for value in non_nullable_list if value not in exceptions]
 
+            if bool(other_values):
+                raise ValueError(f"Only uuid and {self.content_column} can be non-nullable")
+
+            # If both metadata and ignore_metadata are given, throw an error
+            if self.metadata_columns is not None and self.ignore_metadata_columns is not None:
+                raise ValueError("Both metadata_columns and ignore_metadata_columns have been provided.")
+
+        await self.create_default_table()
+
+    @property
     def embeddings(
         self
     ) -> Embeddings:
         return self.embedding_service
 
-    def create_vector_extension(
+    async def create_vector_extension(
         self
     ) -> None:
         """Creates the vector extsion to the specified database."""
-        query = sqlalchemy.text("CREATE EXTENSION IF NOT EXISTS vector")
-        with self.engine.connect() as connection:
-            connection.execute(query)
-            connection.commit()
+        query = "CREATE EXTENSION IF NOT EXISTS vector"
+        await self.engine._aexecute_update(query)
 
-    def create_default_table(
+    async def create_default_table(
         self
     ) -> None:
         """Creates the default table."""
-        if self.engine.dialect.has_table(self.engine.connect(), self.table_name) and self.overwrite_existing == False:
-            raise ValueError("Table already exists.")
-        else:
-            query = f'''
-               CREATE TABLE IF NOT EXISTS {self.table_name} (
-                   uuid UUID PRIMARY KEY,
-                   content VARCHAR(255) NOT NULL,
-                   embedding vector NOT NULL,
-                   metadata JSON NOT NULL
-               );
-               '''
-            with self.engine.connect() as connection:
-                result = connection.execute(sqlalchemy.text(query))
-                connection.commit()
+        query = f'''
+           CREATE TABLE IF NOT EXISTS {self.table_name} (
+               uuid UUID PRIMARY KEY,
+               content TEXT NOT NULL,
+               embedding vector,
+               metadata JSON
+           );
+           '''
+        await self.engine._aexecute_update(query)
 
-    
-    def init_vector_store(
-        self,  
-        table_name: str, 
-        vector_size: int, 
-        content_column: str='content', 
-        embedding_column: str='embedding', 
+    async def init_vector_store(
+        self,
+        table_name: str,
+        vector_size: int,
+        content_column: str='content',
+        embedding_column: str='embedding',
         metadata_columns: Optional[str, List[str]]='metadata',
-        index: HNSWIndex,
-        overwrite_existing: bool=False, 
-        store_metadata: bool=True
+        overwrite_existing: bool=False
     ) -> None:
 
         """Creating a non-default vectorstore table"""
+        if overwrite_existing:
+            query = f"TRUNCATE TABLE {self.table_name} RESET IDENTITY"
+            await self.engine._aexecute_update(query)
+        
         query = f'''
         CREATE TABLE IF NOT EXISTS {table_name} (
             uuid UUID PRIMARY KEY,
-            {content_column} VARCHAR(255) NOT NULL,
-            {embedding_column} vector({vector_size}) NOT NULL,
-            {metadata_columns} JSON NOT NULL
+            {content_column} TEXT NOT NULL,
+            {embedding_column} vector({vector_size}),
+            {metadata_columns} JSON
         );
         '''
-        with self.engine.connect() as connection:
-            result = connection.execute(text(query))
-            connection.commit()
-    
+        await self.engine._aexecute_update(query)
+
     @classmethod
-    def from_documents(
-        cls, 
-        docs: List[Document], 
-        engine: sqlalchemy.engine.Engine, 
+    async def afrom_embeddings(
+        cls: Type[cloudSQLVectorStore],
+        table_name: str,
+        text_embeddings: List[Tuple[str, List[float]]],
+        metadatas: List[Dict]=None,
+        ids: List[int]=None
+    ) -> cloudSQLVectorStore:
+
+        texts = [t[0] for t in text_embeddings]
+        embeddings = [t[1] for t in text_embeddings]
+        metadatas = [{} for _ in texts]
+
+        table = cls(
+            engine=engine,
+            table_name=table_name,
+            )
+        await table.aadd_embeddings(
+            texts=texts, engine=engine, embeddings=embeddings, metadatas=metadatas, ids=ids, table_name=table_name)
+
+        return table
+
+    @classmethod
+    async def afrom_documents(
+        cls: Type[cloudSQLVectorStore],
+        documents: List[Document],
+        engine: Type[cloudSQLEngine],
         table_name: str,
         embedding_service: Embeddings,
-        ids: Optional[List[str]] = None
-    ) -> CloudSQLVectorStore:
-         """Return VectorStore initialized from documents and embeddings."""
+        ids: List[int]=None
+    ) -> cloudSQLVectorStore:
+
         texts = [d.page_content for d in documents]
-        metadatas = [d.metadata for d in documents]
+        metadatas = [json.dumps(d.metadata) for d in documents]
+
         embeddings = embedding_service.embed_documents(list(texts))
 
         table = cls(
@@ -245,65 +342,65 @@ class CloudSQLVectorStore(VectorStore):
             table_name=table_name,
         )
 
-        table.add_embeddings(
+        await table.aadd_embeddings(
             texts=texts, engine=engine, embeddings=embeddings, metadatas=metadatas, ids=ids, table_name=table_name)
-        
+
         return table
-    
+
     @classmethod
-    def from_texts(
-        cls, 
+    async def afrom_texts(
+        cls: Type[cloudSQLVectorStore],
         texts: List[str],
-        metadatas: List[Dict]=None,
-        embedding_service: Embeddings,
-        engine: sqlalchemy.engine.Engine, 
         table_name: str,
-        ids: Optional[List[str]]=None
-    ) -> CloudSQLVectorStore:
+        embedding_service: Embeddings,
+        engine: Type[cloudSQLEngine],
+        metadatas: List[Dict]=None,
+        ids: List[int]=None
+    ) -> cloudSQLVectorStore:
+        
         """ Return VectorStore initialized from texts and embeddings."""
         if not metadatas:
             metadatas = [{} for _ in texts]
 
         documents = []
         for text, meta in zip(texts, metadatas):
-            docs = Document(page_content = text, metadata=meta)
+            docs = Document(page_content=text, metadata=meta)
             documents.append(docs)
 
-        return cls.from_documents(
+        return await cls.afrom_documents(
             engine=engine,
             documents=documents,
             embedding_service=embedding_service,
             table_name=table_name,
             ids=ids)
 
-    def add_embeddings(
+    async def aadd_embeddings(
         self,
-        engine: CloudSQLEngine,
+        engine: Type[cloudSQLEngine],
         texts: List[str],
+        table_name: str,
         embeddings: Embeddings,
-        metadatas: List[float]=None,
-        ids: Optional[List[str]]=None,
-        table_name: str
+        metadatas: List[Dict]=None,
+        ids: List[int]=None
     ) -> List[str]:
 
         if ids is None:
             ids = [str(uuid.uuid1()) for _ in texts]
 
-        with engine.connect() as connection:
-            for id, content, embedding, meta in zip(ids, texts, embeddings, metadatas):
-                data_to_add = {"ids":id, 'content':content, 'embedding':embedding, 'metadata':meta}
-                stmt = f"INSERT INTO {table_name}(ids, content, embedding, metadata) VALUES (:ids, :content, :embedding, :metadata)"
-                connection.execute(sqlalchemy.text(stmt), data_to_add)
-                connection.commit()
+        for id, content, embedding, meta in zip(ids, texts, embeddings, metadatas):
+            data_to_add = {"ids":id, 'content':content, 'embedding':embedding, 'metadata':meta}
+            stmt = f"INSERT INTO {table_name}(uuid, content, embedding, metadata) VALUES (:ids,:content,:embedding,:metadata)"
+            await engine._aexecute_update(stmt, data_to_add)
 
         return ids
 
-    def add_documents(
-        self, 
-        documents: List[Document], 
-        ids: Optional[List[str]]=None
-        ) -> List[str]:
-         """Run more documents through the embeddings and add to the vectorstore.
+    async def aadd_documents(
+        self,
+        documents: List[Document],
+        ids: List[int]=None
+    ) -> List[str]:
+
+        """Run more documents through the embeddings and add to the vectorstore.
 
         Args:
             documents (List[Document]): Iterable of Documents to add to the vectorstore.
@@ -312,35 +409,38 @@ class CloudSQLVectorStore(VectorStore):
         Returns:
             List of ids from adding the texts into the vectorstore.
         """
+
         texts = [d.page_content for d in documents]
-        metadatas = [d.metadata for d in documents]
+        metadatas = [json.dumps(d.metadata) for d in documents]
         embeddings = self.embedding_service.embed_documents(list(texts))
 
-        return self.add_embeddings(
-            texts=texts, 
-            embeddings=embeddings, 
-            metadatas=metadatas, 
-            ids=ids, 
-            engine=self.Engine, 
+        return await self.aadd_embeddings(
+            texts=texts,
+            embeddings=embeddings,
+            metadatas=metadatas,
+            ids=ids,
+            engine=self.Engine,
             table_name=self.table_name)
 
 
-    def add_texts(
-        self, 
-        texts: Iterable[str], 
-        metadatas: Optional[List[dict]]=None, 
-        ids: Optional[List[str]]=None
-        ) -> List[str]:
-         """Run more texts through the embeddings and add to the vectorstore.
+    async def aadd_texts(
+        self,
+        texts: List[str],
+        metadata: List[Dict]=None,
+        ids: List[int]=None
+    ) -> List[str]:
+
+        """Run more texts through the embeddings and add to the vectorstore.
 
         Args:
             texts (str): Iterable of strings to add to the vectorstore.
-            metadatas (List[dict]): Optional list of metadatas associated with the texts. Defaults to None.
+            metadata (List[dict]): Optional list of metadatas associated with the texts. Defaults to None.
             ids (List[str]): List of id strings. Defaults to None
 
         Returns:
             List of ids from adding the texts into the vectorstore.
         """
+        
         if not metadata:
             metadata = [{} for _ in texts]
 
@@ -349,119 +449,116 @@ class CloudSQLVectorStore(VectorStore):
             docs = Document(page_content = text, metadata=meta)
             documents.append(docs)
 
-        return add_documents(
+        return await self.aadd_documents(
             documents=documents,
             ids=ids)
 
-    def __query_collection(
+    async def __query_collection(
         self,
         embedding: List[float],
         k: int=4,
-        filter: str=""
+        filter: str=None
     ) -> List[Any]:
 
         if filter is not None:
             condition = f"WHERE {filter}"
 
-        query = f"""
-            SELECT uuid, {self.content_column}, {self.embedding_column}, metadata, 
-            l2_distance({self.embedding_column}, '{embedding}') as distance 
+            query = f"""
+            SELECT uuid, {self.content_column}, {self.embedding_column}, metadata,
+            l2_distance({self.embedding_column}, '{embedding}') as distance
             FROM {self.table_name} {condition} ORDER BY {self.embedding_column} <-> '{embedding}' LIMIT {k}
+            """
+        else:
+            query = f"""
+            SELECT uuid, {self.content_column}, {self.embedding_column}, metadata,
+            l2_distance({self.embedding_column}, '{embedding}') as distance
+            FROM {self.table_name} ORDER BY {self.embedding_column} <-> '{embedding}' LIMIT {k}
         """
-        with self.engine.connect() as connection:
-            results = connection.execute(sqlalchemy.text(query)).fetchall()
-            connection.commit()
+        results = await self.engine._aexecute_fetch(query)
 
         return results
 
-    def similarity_search(
-        self, 
-        query: str, 
-        k: int=4, 
-        filter: str=""
+    async def asimilarity_search(
+        self,
+        query: str,
+        k: int=4,
+        filter: str=None
     ) -> List[Document]:
 
         embedding = self.embedding_service.embed_query(text=query)
-        
-        return self.similarity_search_by_vector(
-            embedding=embedding, 
-            k=k, 
+
+        return await self.asimilarity_search_by_vector(
+            embedding=embedding,
+            k=k,
             filter=filter
         )
 
-    def similarity_search_by_vector(
+    async def asimilarity_search_by_vector(
         self,
         embedding: List[float],
         k: int=4,
-        filter: str=""
+        filter: str=None
     ) -> List[Document]:
 
-        docs_and_scores = self.similarity_search_with_score_by_vector(
+        docs_and_scores = await self.asimilarity_search_with_score_by_vector(
             embedding=embedding, k=k, filter=filter
         )
 
         return [doc for doc, _ in docs_and_scores]
 
-    def similarity_search_with_score_by_vector(
+    async def asimilarity_search_with_score(
+        self,
+        query: str,
+        k: int=4,
+        filter: str=None
+    ) -> List[Tuple[Document, float]]:
+
+        embedding = self.embedding_service.embed_query(query)
+        docs = await self.asimilarity_search_with_score_by_vector(
+            embedding=embedding, k=k, filter=filter
+        )
+        return docs
+
+    async def asimilarity_search_with_score_by_vector(
         self,
         embedding: List[float],
         k: int=4,
-        filter: str=""
+        filter: str=None
     ) -> List[Tuple[Document, float]]:
 
-        results = self.__query_collection(embedding=embedding, k=k, filter=filter)
-        
-        documents_with_scores = [(Document(page_content=i[1],metadata=i[3],),i[4],)for i in results]
+        results = await self.__query_collection(embedding=embedding, k=k, filter=filter)
+        documents_with_scores = [(Document(page_content=i[f"{self.content_column}"],metadata=i["metadata"],),i['distance'],)for i in results]
         return documents_with_scores
 
-    def max_marginal_relevance_search(
+    async def amax_marginal_relevance_search(
         self,
         query: str,
         k: int=4,
         fetch_k: int=20,
         lambda_mult: float=0.5,
-        filter: str=""
+        filter: str=None
     ) -> List[Document]:
 
-        embedding = self.embedding_service.embed_query(text=query)
-        
-        return self.max_marginal_relevance_search_by_vector(
-            embedding=embedding, 
+        embedding = await self.embedding_service.embed_query(text=query)
+
+        return self.amax_marginal_relevance_search_by_vector(
+            embedding=embedding,
             k=k,
             fetch_k=fetch_k,
             lambda_mult=lambda_mult,
             filter=filter
         )
-
-    def max_marginal_relevance_search_by_vector(
+    async def amax_marginal_relevance_search_with_score_by_vector(
         self,
         embedding: List[float],
         k: int=4,
         fetch_k: int=20,
         lambda_mult: float=0.5,
-        filter: str=""
-    ) -> List[Document]:
+        filter: str=None
+    ) -> List[Tuple[Document, float]]:
 
-        docs_and_scores = self.max_marginal_relevance_search_with_score_by_vector(
-            embedding,
-            k=fetch_k,
-            lambda_mult=lambda_mult,
-            filter=filter
-        )
-
-        return return [doc for doc, _ in docs_and_scores]
-
-    def max_marginal_relevance_search_with_score_by_vector(
-        self,
-        embedding: List[float],
-        k: int=4,
-        fetch_k: int=20,
-        lambda_mult: float=0.5,
-        filter: str=""
-    ) -> > List[Tuple[Document, float]]:
-
-        results = self.__query_collection(embedding=embedding, k=fetch_k, filter=filter)
-        embedding_list = [i[2] for i in results]
+        results = await self.__query_collection(embedding=embedding, k=fetch_k, filter=filter)
+        embedding_list = [i[f"{self.embedding_column}"] for i in results]
 
         mmr_selected = maximal_marginal_relevance(
             np.array(embedding, dtype=np.float32),
@@ -470,6 +567,6 @@ class CloudSQLVectorStore(VectorStore):
             lambda_mult=lambda_mult,
         )
 
-        candidates = [(Document(page_content=i[1],metadata=i[3],),i[4],)for i in results]
+        candidates = [(Document(page_content=i[f"{self.content_column}"],metadata=i["metadata"],),i["distance"],)for i in results]
 
         return [r for i, r in enumerate(candidates) if i in mmr_selected]
