@@ -2,25 +2,27 @@ import json
 import uuid
 
 import asyncio
-import aiohttp
 import asyncpg
 import nest_asyncio
 
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type
+from typing import Any, Dict, List, Optional, Tuple, Type
 from pgvector.asyncpg import register_vector
 
-import sqlalchemy
+# import sqlalchemy
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from google.cloud.sql.connector import Connector
 import google.auth
+import numpy as np
 from google.auth.transport.requests import Request
 
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_core.vectorstores import VectorStore
 from langchain_community.vectorstores.utils import maximal_marginal_relevance
+
+import aiohttp
 
 nest_asyncio.apply()
 
@@ -40,7 +42,7 @@ async def _get_IAM_user(credentials):
 
         return email
 
-class cloudSQLEngine:
+class CloudSQLEngine:
     """Creating a connection to the CloudSQL instance
         To use, you need the following packages installed:
             cloud-sql-python-connector[asyncpg]
@@ -62,14 +64,14 @@ class cloudSQLEngine:
 
     @classmethod
     def from_instance(
-        cls, 
-        project_id: str=None, 
+        cls,  
         region: str, 
         instance: str, 
-        database: str
-    ) -> cloudSQLEngine:
+        database: str,
+        project_id: str=None,
+    ) -> CloudSQLEngine:
 
-        """Create cloudSQLEngine connection to the postgres database in the CloudSQL instance.
+        """Create CloudSQLEngine connection to the postgres database in the CloudSQL instance.
 
         Args:
             region (str): CloudSQL instance region.
@@ -78,7 +80,7 @@ class cloudSQLEngine:
             project_id (str): GCP project ID. Defaults to None
 
         Returns:
-            cloudSQLEngine containing the asyncpg connection pool.
+            CloudSQLEngine containing the asyncpg connection pool.
         """
         return cls(project_id=project_id, region=region, instance=instance, database=database)
 
@@ -86,7 +88,7 @@ class cloudSQLEngine:
     def from_engine(
         cls, 
         engine: AsyncEngine
-    ) -> cloudSQLEngine:
+    ) -> CloudSQLEngine:
 
         return cls(engine=engine)
 
@@ -143,7 +145,7 @@ class cloudSQLEngine:
             result = result.mappings()
             await conn.commit()
         
-class cloudSQLVectorStore(VectorStore):
+class CloudSQLVectorStore(VectorStore):
     """Google Cloud SQL vector store.
 
     To use, you need the following packages installed:
@@ -151,20 +153,26 @@ class cloudSQLVectorStore(VectorStore):
         sqlalchemy
     """
 
-    def __init__(self,
-            engine: Type[cloudSQLEngine],
-            table_name: str,
-            embedding_service: Embeddings,
-            content_column: str='content',
-            embedding_column: str='embedding',
-            metadata_columns: Optional[str, List[str]]='metadata',
-            ignore_metadata_columns: bool=False,
-            overwrite_existing: bool=False,
+    def __init__(
+        self,
+        engine: Type[CloudSQLEngine],
+        table_name: str,
+        vector_size: int,
+        embedding_service: Embeddings,
+        content_column: str='content',
+        embedding_column: str='embedding',
+        metadata_columns: Optional[str, List[str]]='metadata',
+        ignore_metadata_columns: bool=False,
+        index_query_options = None,
+        index: Type[HNSWIndex, IVFFlatIndex, BruteForce]=HNSWIndex,
+        distance_strategy = 'L2',
+        overwrite_existing: bool=False,
+        store_metadata: bool=True
     ):
         """Constructor for CloudSQLVectorStore.
 
         Args:
-            engine (sqlalchemy.engine.Engine): Sqlalchmey engine with pool connection to the postgres database. Required.
+            engine (CloudSQLEngine): AsyncEngine with pool connection to the postgres database. Required.
             embedding_service (Embeddings): Text embedding model to use.
             table_name (str): Name of the existing table or the table to be created.
             content_column (str): Column that represent a Document’s page_content. Defaults to content
@@ -190,17 +198,21 @@ class cloudSQLVectorStore(VectorStore):
 
         self.engine = engine
         self.table_name = table_name
+        self.vector_size = vector_size
         self.embedding_service = embedding_service
         self.embedding_column = embedding_column
         self.content_column = content_column
         self.metadata_columns = metadata_columns
         self.ignore_metadata_columns = ignore_metadata_columns
         self.overwrite_existing = overwrite_existing
+        self.index_query_options = index_query_options
+        self.store_metadata = store_metadata
+        self.distance_strategy = distance_strategy
+        self.index = index
         asyncio.get_running_loop().run_until_complete(self.__post_init__())
 
     async def __post_init__(self) -> None:
         """Initialize table and validate existing tables"""
-        await self.create_vector_extension()
         
         # Check if table exists
         query = f"SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = '{self.table_name}');"
@@ -223,7 +235,7 @@ class cloudSQLVectorStore(VectorStore):
             
             # Check column names and datatype for embedding column
             if 'uuid' not in column_name:
-                raise ValueError(f"Column uuid does not exist")
+                raise ValueError("Column uuid does not exist")
             if self.content_column not in column_name:
                 raise ValueError(f"Column {self.content_column} does not exist")
             if self.embedding_column in column_name:
@@ -233,7 +245,7 @@ class cloudSQLVectorStore(VectorStore):
                 raise ValueError(f"Column {self.embedding_column} does not exist")
 
             if 'metadata' not in column_name:
-                raise ValueError(f"Column metadata does not exist")
+                raise ValueError("Column metadata does not exist")
             
             # Check if there are non-nullable columns
             query = f"SELECT column_name FROM information_schema.columns WHERE table_name = '{self.table_name}' AND is_nullable = 'NO';"
@@ -249,7 +261,17 @@ class cloudSQLVectorStore(VectorStore):
             if self.metadata_columns is not None and self.ignore_metadata_columns is not None:
                 raise ValueError("Both metadata_columns and ignore_metadata_columns have been provided.")
 
-        await self.create_default_table()
+        else:
+            await self.init_vectorstore_table(
+                engine=self.engine, 
+                table_name=self.table_name, 
+                vector_size=self.vector_size,
+                content_column=self.content_column,
+                embedding_column=self.embedding_column,
+                metadata_columns=self.metadata_columns,
+                overwrite_existing=self.overwrite_existing,
+                store_metadata=self.store_metadata
+            )
 
     @property
     def embeddings(
@@ -264,34 +286,26 @@ class cloudSQLVectorStore(VectorStore):
         query = "CREATE EXTENSION IF NOT EXISTS vector"
         await self.engine._aexecute_update(query)
 
-    async def create_default_table(
-        self
-    ) -> None:
-        """Creates the default table."""
-        query = f'''
-           CREATE TABLE IF NOT EXISTS {self.table_name} (
-               uuid UUID PRIMARY KEY,
-               content TEXT NOT NULL,
-               embedding vector,
-               metadata JSON
-           );
-           '''
-        await self.engine._aexecute_update(query)
-
-    async def init_vector_store(
+    async def init_vectorstore_table(
         self,
+        engine: Type[CloudSQLEngine],
         table_name: str,
         vector_size: int,
         content_column: str='content',
         embedding_column: str='embedding',
         metadata_columns: Optional[str, List[str]]='metadata',
-        overwrite_existing: bool=False
+        overwrite_existing: bool=False,
+        store_metadata: bool=True
     ) -> None:
 
         """Creating a non-default vectorstore table"""
+
+        # Create vector extension if not exists
+        await self.create_vector_extension()
+
         if overwrite_existing:
             query = f"TRUNCATE TABLE {self.table_name} RESET IDENTITY"
-            await self.engine._aexecute_update(query)
+            await engine._aexecute_update(query)
         
         query = f'''
         CREATE TABLE IF NOT EXISTS {table_name} (
@@ -301,11 +315,13 @@ class cloudSQLVectorStore(VectorStore):
             {metadata_columns} JSON
         );
         '''
-        await self.engine._aexecute_update(query)
+        await engine._aexecute_update(query)
 
     @classmethod
     async def afrom_embeddings(
-        cls: Type[cloudSQLVectorStore],
+        cls: Type[CloudSQLVectorStore],
+        engine: Type[CloudSQLEngine],
+        embedding_service: Embeddings,
         text_embeddings: List[Tuple[str, List[float]]],
         table_name: str,
         metadatas: List[Dict]=None,
@@ -320,6 +336,7 @@ class cloudSQLVectorStore(VectorStore):
             engine=engine,
             table_name=table_name,
             )
+
         await table.aadd_embeddings(
             texts=texts, engine=engine, embeddings=embeddings, metadatas=metadatas, ids=ids, table_name=table_name)
 
@@ -327,9 +344,9 @@ class cloudSQLVectorStore(VectorStore):
 
     @classmethod
     async def afrom_documents(
-        cls: Type[cloudSQLVectorStore],
+        cls: Type[CloudSQLVectorStore],
         documents: List[Document],
-        engine: Type[cloudSQLEngine],
+        engine: Type[CloudSQLEngine],
         table_name: str,
         embedding_service: Embeddings,
         ids: List[int]=None
@@ -353,14 +370,14 @@ class cloudSQLVectorStore(VectorStore):
 
     @classmethod
     async def afrom_texts(
-        cls: Type[cloudSQLVectorStore],
+        cls: Type[CloudSQLVectorStore],
         texts: List[str],
         table_name: str,
-        metadatas: List[Dict]=None,
         embedding_service: Embeddings,
-        engine: Type[cloudSQLEngine],
+        engine: Type[CloudSQLEngine],
+        metadatas: List[Dict]=None,
         ids: List[int]=None
-    ) -> cloudSQLVectorStore:
+    ) -> CloudSQLVectorStore:
         
         """ Return VectorStore initialized from texts and embeddings."""
         if not metadatas:
@@ -380,7 +397,7 @@ class cloudSQLVectorStore(VectorStore):
 
     async def aadd_embeddings(
         self,
-        engine: Type[cloudSQLEngine],
+        engine: Type[CloudSQLEngine],
         texts: List[str],
         table_name: str,
         embeddings: Embeddings,
@@ -574,3 +591,127 @@ class cloudSQLVectorStore(VectorStore):
         candidates = [(Document(page_content=i[f"{self.content_column}"],metadata=i["metadata"],),i["distance"],)for i in results]
 
         return [r for i, r in enumerate(candidates) if i in mmr_selected]
+
+    async def _acreate_index(
+        self,
+        index: Union[HNSWIndex, IVFFlatIndex, BruteForce]
+    ):
+
+        if isinstance(index, BruteForce):
+            return None
+
+        distance = 'l2' if distance_strategy == 'L2' else 'ip' if distance_strategy == 'INNER' else 'cosine'
+        index_type = 'hnsw' if istinstance(index, HNSWIndex()) else 'ivfflat'
+        if partial_indexes == None:
+            condition = ""
+        else:
+            condition = f"WHERE (partial_indexes)"
+
+        if index_type == 'hnsw':
+            query = f"CREATE INDEX ON {self.table_name} USING hnsw ({self.embedding_column} vector_{distance}_ops) WITH (m={index.m}, ef_construction={index.ef_construction}) {condition}"
+        else:
+            query = f"CREATE INDEX ON {self.table_name} USING ivfflat ({self.embedding_column} vector_{distance}_ops) WITH (lists={index.lists}) {condition}"
+
+        await self.engine._aexecute_update(query)
+
+    async def _aindex_query_options(
+        self,
+        index_query_options: Type[HNSWIndex.QueryOptions()]
+    ):
+
+        if isinstance(index_query_options, HNSWIndex.QueryOptions):
+            query_options = index_query_options.ef_search
+            quey = f"SET hnsw.ef_search = {query_options}"
+        else:
+            query_options = index_query_options.probes
+            query = f"SET ivfflat.probes = {query_options}"
+
+        await self.engine._aexecute_update(query)
+
+    async def areindex(
+        self,
+        index: Union[HNSWIndex, IVFFlatIndex, BruteForce],
+        index_name: Optional
+    ):
+
+        if name:
+            query = f"REINDEX INDEX {index_name}"
+            await self.engine._aexecute_update(query)
+        else:
+            await _acreate_index(index)
+        
+
+    async def adrop_index(
+        self
+    ):
+        query = f"SELECT indexname, indexdef FROM pg_indexes WHERE tablename='{self.table_name}'"
+        current_index = await self.engine._aexecute_fetch(query)
+        index_def = current_index[0]['indexdef']
+        if 'hnsw' in  index_def or 'ivfflat' in index_def:
+            current_index = current_index['indexname']
+            query = f"DROP INDEX {current_index}"
+            await self.engine._aexecute_update(query)
+        else:
+            raise ValueError("Cannot drop Index")
+
+    async def aset_index_query_options(
+        self,
+        distance_strategy,
+        index_query_options
+    ):
+        self.distance_strategy = distance_strategy
+        self.index_query_options = index_query_options
+        await self._aindex_query_options()
+
+
+class BruteForce:
+
+    def __init__(
+        self,
+        distance_strategy: str='L2'
+    ):
+
+        self.distance_strategy = distance_strategy
+
+class HNSWIndex:
+
+    def __init__(
+        self,
+        m: int=16,
+        ef_construction: int=64,
+        partial_indexes: List=None,
+        distance_strategy: str='L2'
+    ):
+        self.m = m
+        self.ef_construction = ef_construction
+        self.partial_indexes = partial_indexes
+        self.distance_strategy = distance_strategy
+
+    class QueryOptions(
+        self, 
+        ef_search
+    ):
+
+        self.ef_search = ef_search
+
+class IVFFlatIndex:
+
+    def __init__(
+        self,
+        lists: int=1,
+        partial_indexes: List=None,
+        distance_strategy: str='L2'
+    ):
+
+        self.lists = lists
+        self.partial_indexes = partial_indexes
+        self.distance_strategy = distance_strategy
+
+    class QueryOptions:
+
+        def __init__(
+            self,
+            probes
+        ):
+
+            self.probes = probes
