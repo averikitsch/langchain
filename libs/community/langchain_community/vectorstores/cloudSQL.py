@@ -3,7 +3,6 @@ import uuid
 
 import asyncio
 import asyncpg
-import nest_asyncio
 
 from typing import Any, Dict, List, Optional, Tuple, Type
 from pgvector.asyncpg import register_vector
@@ -23,8 +22,6 @@ from langchain_core.vectorstores import VectorStore
 from langchain_community.vectorstores.utils import maximal_marginal_relevance
 
 import aiohttp
-
-nest_asyncio.apply()
 
 async def _get_IAM_user(credentials):
     """Get user/service account name"""
@@ -60,7 +57,14 @@ class CloudSQLEngine:
         self.instance = instance
         self.database = database
         self.engine = engine
-        self._pool = asyncio.get_event_loop().run_until_complete(self._engine())
+        self._loop = asyncio.new_event_loop()
+        self._thread = Thread(target=self._loop.run_forever, daemon=True)
+        self._thread.start()
+        pool_object = asyncio.wrap_future(asyncio.run_coroutine_threadsafe(self.async_func(), self._loop),
+            loop=self._loop,
+        )
+        time.sleep(1)
+        self._pool = pool_object.result()
 
     @classmethod
     def from_instance(
@@ -616,7 +620,7 @@ class CloudSQLVectorStore(VectorStore):
 
     async def _aindex_query_options(
         self,
-        index_query_options: Type[HNSWIndex.QueryOptions()]
+        index_query_options: Type[HNSWIndex.QueryOptions]
     ):
 
         if isinstance(index_query_options, HNSWIndex.QueryOptions):
