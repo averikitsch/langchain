@@ -1,27 +1,23 @@
-import json
-import uuid
+from __future__ import annotations
 
 import asyncio
-import asyncpg
-
+import json
+import uuid
+from threading import Thread
 from typing import Any, Dict, List, Optional, Tuple, Type
-from pgvector.asyncpg import register_vector
 
-# import sqlalchemy
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
-
-from google.cloud.sql.connector import Connector
+import aiohttp
 import google.auth
 import numpy as np
-from google.auth.transport.requests import Request
-
+from google.cloud.sql.connector import Connector
+from langchain_community.vectorstores.utils import maximal_marginal_relevance
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_core.vectorstores import VectorStore
-from langchain_community.vectorstores.utils import maximal_marginal_relevance
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.pool import NullPool
 
-import aiohttp
 
 async def _get_IAM_user(credentials):
     """Get user/service account name"""
@@ -33,25 +29,32 @@ async def _get_IAM_user(credentials):
         response = await client.get(url)
         response = await response.text()
         response = json.loads(response)
-        email =  response['email']
+        email = response['email']
         if ".gserviceaccount.com" in email:
-            email = email.replace(".gserviceaccount.com","")
+            email = email.replace(".gserviceaccount.com", "")
 
         return email
 
-class CloudSQLEngine:
+
+class CloudSQLEngine():
     """Creating a connection to the CloudSQL instance
         To use, you need the following packages installed:
             cloud-sql-python-connector[asyncpg]
     """
+
+    __create_key = object()
+
     def __init__(
-        self, 
-        project_id=None, 
-        region=None, 
-        instance=None, 
-        database=None, 
-        engine=None
+            self,
+            key,
+            project_id=None,
+            region=None,
+            instance=None,
+            database=None,
+            engine=None
     ):
+        if key != CloudSQLEngine.__create_key:
+            raise Exception("Only create class through from_instance and from_engine methods!")
         self.project_id = project_id
         self.region = region
         self.instance = instance
@@ -60,19 +63,15 @@ class CloudSQLEngine:
         self._loop = asyncio.new_event_loop()
         self._thread = Thread(target=self._loop.run_forever, daemon=True)
         self._thread.start()
-        pool_object = asyncio.wrap_future(asyncio.run_coroutine_threadsafe(self.async_func(), self._loop),
-            loop=self._loop,
-        )
-        time.sleep(1)
-        self._pool = pool_object.result()
+        self._pool = asyncio.run_coroutine_threadsafe(self._engine(), self._loop).result()
 
     @classmethod
     def from_instance(
-        cls,  
-        region: str, 
-        instance: str, 
-        database: str,
-        project_id: str=None,
+            cls,
+            region: str,
+            instance: str,
+            database: str,
+            project_id: str = None,
     ) -> CloudSQLEngine:
 
         """Create CloudSQLEngine connection to the postgres database in the CloudSQL instance.
@@ -86,18 +85,19 @@ class CloudSQLEngine:
         Returns:
             CloudSQLEngine containing the asyncpg connection pool.
         """
-        return cls(project_id=project_id, region=region, instance=instance, database=database)
+        return cls(project_id=project_id, region=region, instance=instance, database=database,
+                   key=CloudSQLEngine.__create_key)
 
     @classmethod
     def from_engine(
-        cls, 
-        engine: AsyncEngine
+            cls,
+            engine: AsyncEngine
     ) -> CloudSQLEngine:
 
-        return cls(engine=engine)
+        return cls(engine=engine, key=CloudSQLEngine.__create_key)
 
     async def _engine(self) -> AsyncEngine:
-        
+
         if self.engine is not None:
             return self.engine
 
@@ -109,26 +109,26 @@ class CloudSQLEngine:
         async def get_conn():
             async with Connector(loop=asyncio.get_running_loop()) as connector:
                 conn = await connector.connect_async(
-                        f"{self.project_id}:{self.region}:{self.instance}",
-                        "asyncpg",
-                        user=await _get_IAM_user(credentials),
-                        enable_iam_auth=True,
-                        db=self.database,
-                    )
-            
-            await register_vector(conn)
+                    f"{self.project_id}:{self.region}:{self.instance}",
+                    "asyncpg",
+                    user=await _get_IAM_user(credentials),
+                    enable_iam_auth=True,
+                    db=self.database,
+                )
+
             return conn
 
         pool = create_async_engine(
-                "postgresql+asyncpg://",
-                async_creator=get_conn,
+            "postgresql+asyncpg://",
+            poolclass=NullPool,
+            async_creator=get_conn,
         )
 
         return pool
-    
+
     async def _aexecute_fetch(
-        self, 
-        query
+            self,
+            query
     ) -> Any:
 
         async with self._pool.connect() as conn:
@@ -139,16 +139,72 @@ class CloudSQLEngine:
         return result_fetch
 
     async def _aexecute_update(
-        self, 
-        query, 
-        additional=None
+            self,
+            query,
+            additional=None
     ) -> None:
 
         async with self._pool.connect() as conn:
-            result = (await conn.execute(text(query),additional))
+            result = (await conn.execute(text(query), additional))
             result = result.mappings()
             await conn.commit()
-        
+
+
+class BruteForce:
+
+    def __init__(
+            self,
+            distance_strategy: str = 'L2'
+    ):
+        self.distance_strategy = 'l2' if distance_strategy == 'L2' else 'ip' if distance_strategy == 'INNER' else 'cosine'
+
+
+class HNSWIndex:
+
+    def __init__(
+            self,
+            m: int = 16,
+            ef_construction: int = 64,
+            partial_indexes: List = None,
+            distance_strategy: str = 'L2'
+    ):
+        self.m = m
+        self.ef_construction = ef_construction
+        self.partial_indexes = partial_indexes
+        self.distance_strategy = 'l2' if distance_strategy == 'L2' else 'ip' if distance_strategy == 'INNER' else 'cosine'
+        self.index_type = 'hnsw'
+
+    class QueryOptions:
+
+        def __init__(
+                self,
+                ef_search
+        ):
+            self.ef_search = ef_search
+
+
+class IVFFlatIndex:
+
+    def __init__(
+            self,
+            lists: int = 1,
+            partial_indexes: List = None,
+            distance_strategy: str = 'L2'
+    ):
+        self.lists = lists
+        self.partial_indexes = partial_indexes
+        self.distance_strategy = 'l2' if distance_strategy == 'L2' else 'ip' if distance_strategy == 'INNER' else 'cosine'
+        self.index_type = 'ivfflat'
+
+    class QueryOptions:
+
+        def __init__(
+                self,
+                probes
+        ):
+            self.probes = probes
+
+
 class CloudSQLVectorStore(VectorStore):
     """Google Cloud SQL vector store.
 
@@ -158,20 +214,19 @@ class CloudSQLVectorStore(VectorStore):
     """
 
     def __init__(
-        self,
-        engine: Type[CloudSQLEngine],
-        table_name: str,
-        vector_size: int,
-        embedding_service: Embeddings,
-        content_column: str='content',
-        embedding_column: str='embedding',
-        metadata_columns: Optional[str, List[str]]='metadata',
-        ignore_metadata_columns: bool=False,
-        index_query_options = None,
-        index: Type[HNSWIndex, IVFFlatIndex, BruteForce]=HNSWIndex,
-        distance_strategy = 'L2',
-        overwrite_existing: bool=False,
-        store_metadata: bool=True
+            self,
+            engine: CloudSQLEngine,
+            table_name: str,
+            embedding_service: Embeddings,
+            vector_size: int = 768,
+            content_column: str = 'content',
+            embedding_column: str = 'embedding',
+            metadata_columns: Optional[str, List[str]] = 'metadata',
+            ignore_metadata_columns: Optional[str, List[str]] = None,
+            index_query_options=None,
+            index: Type[HNSWIndex, IVFFlatIndex, BruteForce] = HNSWIndex(),
+            distance_strategy='L2',
+            overwrite_existing: bool = False
     ):
         """Constructor for CloudSQLVectorStore.
 
@@ -180,10 +235,10 @@ class CloudSQLVectorStore(VectorStore):
             embedding_service (Embeddings): Text embedding model to use.
             table_name (str): Name of the existing table or the table to be created.
             content_column (str): Column that represent a Document’s page_content. Defaults to content
-            embedding_column (str): Column for embedding vectors. 
+            embedding_column (str): Column for embedding vectors.
                               The embedding is generated from the document value. Defaults to embedding
             metadata_columns (List[str]): Column(s) that represent a document's metadata. Defaults to metadata
-            ignore_metadata_columns (List[str]): Column(s) to ignore in pre-existing tables for a document’s metadata. 
+            ignore_metadata_columns (List[str]): Column(s) to ignore in pre-existing tables for a document’s metadata.
                                      Can not be used with metadata_columns. Defaults to None
             overwrite_existing (bool): Boolean for truncating table before inserting data. Defaults to False
             index_query_options : QueryOptions class with vector search parameters. Defaults to None
@@ -210,14 +265,16 @@ class CloudSQLVectorStore(VectorStore):
         self.ignore_metadata_columns = ignore_metadata_columns
         self.overwrite_existing = overwrite_existing
         self.index_query_options = index_query_options
-        self.store_metadata = store_metadata
         self.distance_strategy = distance_strategy
         self.index = index
-        asyncio.get_running_loop().run_until_complete(self.__post_init__())
+        self._loop = asyncio.new_event_loop()
+        self._thread = Thread(target=self._loop.run_forever, daemon=True)
+        self._thread.start()
+        asyncio.run_coroutine_threadsafe(self.__post_init__(), self._loop).result()
 
     async def __post_init__(self) -> None:
         """Initialize table and validate existing tables"""
-        
+
         # Check if table exists
         query = f"SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = '{self.table_name}');"
         result = await self.engine._aexecute_fetch(query)
@@ -231,12 +288,12 @@ class CloudSQLVectorStore(VectorStore):
             # Checking if metadata and ignore_metadata are given together
             if self.metadata_columns is not None and self.ignore_metadata_columns is not None:
                 raise ValueError("Both metadata_columns and ignore_metadata_columns have been provided.")
-            
+
             get_name = f"SELECT column_name, data_type FROM information_schema.columns WHERE table_name = '{self.table_name}'"
             result = await self.engine._aexecute_fetch(get_name)
             column_name = [col['column_name'] for col in result]
             dtypes = [dtype['data_type'] for dtype in result]
-            
+
             # Check column names and datatype for embedding column
             if 'uuid' not in column_name:
                 raise ValueError("Column uuid does not exist")
@@ -250,7 +307,7 @@ class CloudSQLVectorStore(VectorStore):
 
             if 'metadata' not in column_name:
                 raise ValueError("Column metadata does not exist")
-            
+
             # Check if there are non-nullable columns
             query = f"SELECT column_name FROM information_schema.columns WHERE table_name = '{self.table_name}' AND is_nullable = 'NO';"
             result = await self.engine._aexecute_fetch(query)
@@ -267,39 +324,37 @@ class CloudSQLVectorStore(VectorStore):
 
         else:
             await self.init_vectorstore_table(
-                engine=self.engine, 
-                table_name=self.table_name, 
+                engine=self.engine,
+                table_name=self.table_name,
                 vector_size=self.vector_size,
                 content_column=self.content_column,
                 embedding_column=self.embedding_column,
                 metadata_columns=self.metadata_columns,
-                overwrite_existing=self.overwrite_existing,
-                store_metadata=self.store_metadata
+                overwrite_existing=self.overwrite_existing
             )
 
     @property
     def embeddings(
-        self
+            self
     ) -> Embeddings:
         return self.embedding_service
 
     async def create_vector_extension(
-        self
+            self
     ) -> None:
         """Creates the vector extsion to the specified database."""
         query = "CREATE EXTENSION IF NOT EXISTS vector"
         await self.engine._aexecute_update(query)
 
     async def init_vectorstore_table(
-        self,
-        engine: Type[CloudSQLEngine],
-        table_name: str,
-        vector_size: int,
-        content_column: str='content',
-        embedding_column: str='embedding',
-        metadata_columns: Optional[str, List[str]]='metadata',
-        overwrite_existing: bool=False,
-        store_metadata: bool=True
+            self,
+            engine: Type[CloudSQLEngine],
+            table_name: str,
+            vector_size: int,
+            content_column: str = 'content',
+            embedding_column: str = 'embedding',
+            metadata_columns: Optional[str, List[str]] = 'metadata',
+            overwrite_existing: bool = False
     ) -> None:
 
         """Creating a non-default vectorstore table"""
@@ -310,7 +365,7 @@ class CloudSQLVectorStore(VectorStore):
         if overwrite_existing:
             query = f"TRUNCATE TABLE {self.table_name} RESET IDENTITY"
             await engine._aexecute_update(query)
-        
+
         query = f'''
         CREATE TABLE IF NOT EXISTS {table_name} (
             uuid UUID PRIMARY KEY,
@@ -323,23 +378,24 @@ class CloudSQLVectorStore(VectorStore):
 
     @classmethod
     async def afrom_embeddings(
-        cls: Type[CloudSQLVectorStore],
-        engine: Type[CloudSQLEngine],
-        embedding_service: Embeddings,
-        text_embeddings: List[Tuple[str, List[float]]],
-        table_name: str,
-        metadatas: List[Dict]=None,
-        ids: List[int]=None
+            cls: Type[CloudSQLVectorStore],
+            engine: Type[CloudSQLEngine],
+            embedding_service: Embeddings,
+            text_embeddings: List[Tuple[str, List[float]]],
+            table_name: str,
+            metadatas: List[Dict] = None,
+            ids: List[int] = None
     ) -> cloudSQLVectorStore:
 
         texts = [t[0] for t in text_embeddings]
         embeddings = [t[1] for t in text_embeddings]
-        metadatas = [{} for _ in texts]
+        if metadatas is None:
+            metadatas = [{} for _ in texts]
 
         table = cls(
             engine=engine,
             table_name=table_name,
-            )
+        )
 
         await table.aadd_embeddings(
             texts=texts, engine=engine, embeddings=embeddings, metadatas=metadatas, ids=ids, table_name=table_name)
@@ -348,12 +404,12 @@ class CloudSQLVectorStore(VectorStore):
 
     @classmethod
     async def afrom_documents(
-        cls: Type[CloudSQLVectorStore],
-        documents: List[Document],
-        engine: Type[CloudSQLEngine],
-        table_name: str,
-        embedding_service: Embeddings,
-        ids: List[int]=None
+            cls: Type[CloudSQLVectorStore],
+            documents: List[Document],
+            engine: Type[CloudSQLEngine],
+            table_name: str,
+            embedding_service: Embeddings,
+            ids: List[int] = None
     ) -> cloudSQLVectorStore:
 
         texts = [d.page_content for d in documents]
@@ -373,16 +429,16 @@ class CloudSQLVectorStore(VectorStore):
         return table
 
     @classmethod
-    async def afrom_texts(
-        cls: Type[CloudSQLVectorStore],
-        texts: List[str],
-        table_name: str,
-        embedding_service: Embeddings,
-        engine: Type[CloudSQLEngine],
-        metadatas: List[Dict]=None,
-        ids: List[int]=None
+    async def from_texts(
+            cls: Type[CloudSQLVectorStore],
+            texts: List[str],
+            table_name: str,
+            embedding_service: Embeddings,
+            engine: Type[CloudSQLEngine],
+            metadatas: List[Dict] = None,
+            ids: List[int] = None
     ) -> CloudSQLVectorStore:
-        
+
         """ Return VectorStore initialized from texts and embeddings."""
         if not metadatas:
             metadatas = [{} for _ in texts]
@@ -400,29 +456,29 @@ class CloudSQLVectorStore(VectorStore):
             ids=ids)
 
     async def aadd_embeddings(
-        self,
-        engine: Type[CloudSQLEngine],
-        texts: List[str],
-        table_name: str,
-        embeddings: Embeddings,
-        metadatas: List[Dict]=None,
-        ids: List[int]=None
+            self,
+            engine: Type[CloudSQLEngine],
+            texts: List[str],
+            table_name: str,
+            embeddings: Embeddings,
+            metadatas: List[Dict] = None,
+            ids: List[int] = None
     ) -> List[str]:
 
         if ids is None:
             ids = [str(uuid.uuid1()) for _ in texts]
 
         for id, content, embedding, meta in zip(ids, texts, embeddings, metadatas):
-            data_to_add = {"ids":id, 'content':content, 'embedding':embedding, 'metadata':meta}
-            stmt = f"INSERT INTO {table_name}(uuid, content, embedding, metadata) VALUES (:ids,:content,:embedding,:metadata)"
-            await engine._aexecute_update(stmt, data_to_add)
+            # data_to_add = {"ids":id, 'content':content, 'embedding':embedding, 'metadata':meta}
+            stmt = f"INSERT INTO {table_name}(uuid, content, embedding, metadata) VALUES ('{id}','{content}','{embedding}','{meta}')"
+            await engine._aexecute_update(stmt)
 
         return ids
 
     async def aadd_documents(
-        self,
-        documents: List[Document],
-        ids: List[int]=None
+            self,
+            documents: List[Document],
+            ids: List[int] = None
     ) -> List[str]:
 
         """Run more documents through the embeddings and add to the vectorstore.
@@ -447,12 +503,11 @@ class CloudSQLVectorStore(VectorStore):
             engine=self.Engine,
             table_name=self.table_name)
 
-
-    async def aadd_texts(
-        self,
-        texts: List[str],
-        metadatas: List[Dict]=None,
-        ids: List[int]=None
+    async def add_texts(
+            self,
+            texts: List[str],
+            metadatas: List[Dict] = None,
+            ids: List[int] = None
     ) -> List[str]:
 
         """Run more texts through the embeddings and add to the vectorstore.
@@ -465,13 +520,13 @@ class CloudSQLVectorStore(VectorStore):
         Returns:
             List of ids from adding the texts into the vectorstore.
         """
-        
+        metadata = []
         if not metadatas:
-            metadata = [{} for _ in texts]
+            metadatas = [{} for _ in texts]
 
         documents = []
-        for text, meta in zip(texts, metadatas):
-            docs = Document(page_content = text, metadata=meta)
+        for text, metadata in zip(texts, metadatas):
+            docs = Document(page_content=text, metadata=metadata)
             documents.append(docs)
 
         return await self.aadd_documents(
@@ -479,10 +534,10 @@ class CloudSQLVectorStore(VectorStore):
             ids=ids)
 
     async def __query_collection(
-        self,
-        embedding: List[float],
-        k: int=4,
-        filter: str=None
+            self,
+            embedding: List[float],
+            k: int = 4,
+            filter: str = None
     ) -> List[Any]:
 
         if filter is not None:
@@ -503,11 +558,11 @@ class CloudSQLVectorStore(VectorStore):
 
         return results
 
-    async def asimilarity_search(
-        self,
-        query: str,
-        k: int=4,
-        filter: str=None
+    async def similarity_search(
+            self,
+            query: str,
+            k: int = 4,
+            filter: str = None
     ) -> List[Document]:
 
         embedding = self.embedding_service.embed_query(text=query)
@@ -519,10 +574,10 @@ class CloudSQLVectorStore(VectorStore):
         )
 
     async def asimilarity_search_by_vector(
-        self,
-        embedding: List[float],
-        k: int=4,
-        filter: str=None
+            self,
+            embedding: List[float],
+            k: int = 4,
+            filter: str = None
     ) -> List[Document]:
 
         docs_and_scores = await self.asimilarity_search_with_score_by_vector(
@@ -532,10 +587,10 @@ class CloudSQLVectorStore(VectorStore):
         return [doc for doc, _ in docs_and_scores]
 
     async def asimilarity_search_with_score(
-        self,
-        query: str,
-        k: int=4,
-        filter: str=None
+            self,
+            query: str,
+            k: int = 4,
+            filter: str = None
     ) -> List[Tuple[Document, float]]:
 
         embedding = self.embedding_service.embed_query(query)
@@ -545,23 +600,25 @@ class CloudSQLVectorStore(VectorStore):
         return docs
 
     async def asimilarity_search_with_score_by_vector(
-        self,
-        embedding: List[float],
-        k: int=4,
-        filter: str=None
+            self,
+            embedding: List[float],
+            k: int = 4,
+            filter: str = None
     ) -> List[Tuple[Document, float]]:
 
         results = await self.__query_collection(embedding=embedding, k=k, filter=filter)
-        documents_with_scores = [(Document(page_content=i[f"{self.content_column}"],metadata=i["metadata"],),i['distance'],)for i in results]
+        documents_with_scores = [
+            (Document(page_content=i[f"{self.content_column}"], metadata=i["metadata"], ), i['distance'],) for i in
+            results]
         return documents_with_scores
 
     async def amax_marginal_relevance_search(
-        self,
-        query: str,
-        k: int=4,
-        fetch_k: int=20,
-        lambda_mult: float=0.5,
-        filter: str=None
+            self,
+            query: str,
+            k: int = 4,
+            fetch_k: int = 20,
+            lambda_mult: float = 0.5,
+            filter: str = None
     ) -> List[Document]:
 
         embedding = await self.embedding_service.embed_query(text=query)
@@ -573,13 +630,14 @@ class CloudSQLVectorStore(VectorStore):
             lambda_mult=lambda_mult,
             filter=filter
         )
+
     async def amax_marginal_relevance_search_with_score_by_vector(
-        self,
-        embedding: List[float],
-        k: int=4,
-        fetch_k: int=20,
-        lambda_mult: float=0.5,
-        filter: str=None
+            self,
+            embedding: List[float],
+            k: int = 4,
+            fetch_k: int = 20,
+            lambda_mult: float = 0.5,
+            filter: str = None
     ) -> List[Tuple[Document, float]]:
 
         results = await self.__query_collection(embedding=embedding, k=fetch_k, filter=filter)
@@ -592,40 +650,40 @@ class CloudSQLVectorStore(VectorStore):
             lambda_mult=lambda_mult,
         )
 
-        candidates = [(Document(page_content=i[f"{self.content_column}"],metadata=i["metadata"],),i["distance"],)for i in results]
+        candidates = [(Document(page_content=i[f"{self.content_column}"], metadata=i["metadata"], ), i["distance"],) for
+                      i in results]
 
         return [r for i, r in enumerate(candidates) if i in mmr_selected]
 
     async def _acreate_index(
-        self,
-        index: Union[HNSWIndex, IVFFlatIndex, BruteForce]
-    ):
+            self,
+            index: Union[HNSWIndex, IVFFlatIndex, BruteForce]
+    ) -> None:
 
         if isinstance(index, BruteForce):
             return None
 
-        distance = 'l2' if distance_strategy == 'L2' else 'ip' if distance_strategy == 'INNER' else 'cosine'
-        index_type = 'hnsw' if istinstance(index, HNSWIndex()) else 'ivfflat'
-        if partial_indexes == None:
+        if index.partial_indexes is None:
             condition = ""
         else:
             condition = f"WHERE (partial_indexes)"
 
-        if index_type == 'hnsw':
-            query = f"CREATE INDEX ON {self.table_name} USING hnsw ({self.embedding_column} vector_{distance}_ops) WITH (m={index.m}, ef_construction={index.ef_construction}) {condition}"
+        if index.index_type is 'hnsw':
+            query = f"CREATE INDEX ON {self.table_name} USING hnsw ({self.embedding_column} vector_{index.distance_strategy}_ops) WITH (m={index.m}, ef_construction={index.ef_construction}) {condition}"
         else:
-            query = f"CREATE INDEX ON {self.table_name} USING ivfflat ({self.embedding_column} vector_{distance}_ops) WITH (lists={index.lists}) {condition}"
+            query = f"CREATE INDEX ON {self.table_name} USING ivfflat ({self.embedding_column} vector_{index.distance_strategy}_ops) WITH (lists={index.lists}) {condition}"
 
         await self.engine._aexecute_update(query)
 
     async def _aindex_query_options(
-        self,
-        index_query_options: Type[HNSWIndex.QueryOptions]
-    ):
+            self,
+            index_query_options: Type[HNSWIndex.QueryOptions]
+    ) -> None:
 
         if isinstance(index_query_options, HNSWIndex.QueryOptions):
             query_options = index_query_options.ef_search
-            quey = f"SET hnsw.ef_search = {query_options}"
+            query = f"SET hnsw.ef_search = {query_options}"
+
         else:
             query_options = index_query_options.probes
             query = f"SET ivfflat.probes = {query_options}"
@@ -633,89 +691,37 @@ class CloudSQLVectorStore(VectorStore):
         await self.engine._aexecute_update(query)
 
     async def areindex(
-        self,
-        index: Union[HNSWIndex, IVFFlatIndex, BruteForce],
-        index_name: Optional
-    ):
+            self,
+            index: Union[HNSWIndex, IVFFlatIndex, BruteForce],
+            index_name: Optional = None
+    ) -> None:
 
-        if name:
+        if index_name:
             query = f"REINDEX INDEX {index_name}"
             await self.engine._aexecute_update(query)
         else:
-            await _acreate_index(index)
-        
+            await self._acreate_index(index)
 
     async def adrop_index(
-        self
-    ):
+            self
+    ) -> None:
         query = f"SELECT indexname, indexdef FROM pg_indexes WHERE tablename='{self.table_name}'"
         current_index = await self.engine._aexecute_fetch(query)
-        index_def = current_index[0]['indexdef']
-        if 'hnsw' in  index_def or 'ivfflat' in index_def:
-            current_index = current_index['indexname']
+        index_def = current_index[-1]['indexdef']
+        if 'hnsw' in index_def or 'ivfflat' in index_def:
+            current_index = current_index[-1]['indexname']
             query = f"DROP INDEX {current_index}"
             await self.engine._aexecute_update(query)
         else:
             raise ValueError("Cannot drop Index")
 
     async def aset_index_query_options(
-        self,
-        distance_strategy,
-        index_query_options
-    ):
-        self.distance_strategy = distance_strategy
-        self.index_query_options = index_query_options
-        await self._aindex_query_options()
-
-
-class BruteForce:
-
-    def __init__(
-        self,
-        distance_strategy: str='L2'
-    ):
-
-        self.distance_strategy = distance_strategy
-
-class HNSWIndex:
-
-    def __init__(
-        self,
-        m: int=16,
-        ef_construction: int=64,
-        partial_indexes: List=None,
-        distance_strategy: str='L2'
-    ):
-        self.m = m
-        self.ef_construction = ef_construction
-        self.partial_indexes = partial_indexes
-        self.distance_strategy = distance_strategy
-
-    class QueryOptions(
-        self, 
-        ef_search
-    ):
-
-        self.ef_search = ef_search
-
-class IVFFlatIndex:
-
-    def __init__(
-        self,
-        lists: int=1,
-        partial_indexes: List=None,
-        distance_strategy: str='L2'
-    ):
-
-        self.lists = lists
-        self.partial_indexes = partial_indexes
-        self.distance_strategy = distance_strategy
-
-    class QueryOptions:
-
-        def __init__(
             self,
-            probes
-        ):
-
-            self.probes = probes
+            distance_strategy,
+            index_query_options
+    ):
+        if distance_strategy is not None:
+            self.distance_strategy = distance_strategy
+        if index_query_options is not None:
+            self.index_query_options = index_query_options
+        await self._aindex_query_options(self.index_query_options)
